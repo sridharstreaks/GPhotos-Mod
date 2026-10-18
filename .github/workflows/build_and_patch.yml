@@ -179,22 +179,20 @@ jobs:
           echo "RELEASE_VERSION=${APK_VER}" >> $GITHUB_ENV
           echo "Prepared release filenames: $OUT_MOD , $OUT_ORIGINAL"
 
-            - name: Sign Patched APKs (use secret or generate temporary keystore)
+      - name: Sign Patched APKs (use secret or generate temporary keystore)
         if: steps.check_release.outputs.skip != 'true'
         run: |
           set -euo pipefail
 
-          # Recompute release filenames locally to avoid unbound-variable issues
           APK_VER="${{ steps.get_apk_ver.outputs.apk_version }}"
           APK_VER=$(echo "$APK_VER" | sed -e 's/[^0-9.]//g' -e 's/\.*$//')
           if [ -z "$APK_VER" ]; then
             APK_VER="build-${{ github.run_number }}"
           fi
+
           OUT_MOD="GPhotos-Mod-v${APK_VER}-mod.apk"
           OUT_ORIGINAL="GPhotos-Mod-v${APK_VER}-original.apk"
-          echo "Signing target filenames: $OUT_MOD , $OUT_ORIGINAL"
 
-          # Choose keystore: provided secret or generate temporary
           if [ -n "${{ secrets.KEYSTORE_BASE64 }}" ]; then
             echo "Using provided KEYSTORE_BASE64 secret"
             echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > release.keystore
@@ -235,13 +233,10 @@ jobs:
               exit 1
             fi
 
-            # 1) Repack to normalize headers
             python3 .github/scripts/repack_apk.py --input "$IN_UNSIGNED" --output "patched-${FLAVOR}-fixed.apk"
 
-            # 2) Zipalign
             $BUILD_TOOLS_DIR/zipalign -v -p 4 "patched-${FLAVOR}-fixed.apk" "patched-${FLAVOR}-aligned.apk"
 
-            # 3) Sign
             TARGET_OUT=$([ "$FLAVOR" = "mod" ] && echo "$OUT_MOD" || echo "$OUT_ORIGINAL")
             echo "Signing -> $TARGET_OUT"
             $BUILD_TOOLS_DIR/apksigner sign \
@@ -252,7 +247,6 @@ jobs:
               --out "${TARGET_OUT}" \
               "patched-${FLAVOR}-aligned.apk"
 
-            # 4) Verify
             echo "Verifying signature for ${TARGET_OUT}..."
             $BUILD_TOOLS_DIR/apksigner verify --verbose "${TARGET_OUT}"
 
@@ -260,7 +254,7 @@ jobs:
           done
 
           rm -f release.keystore || true
-          
+
       - name: Upload Mod APK Artifact
         if: steps.check_release.outputs.skip != 'true'
         uses: actions/upload-artifact@v4
