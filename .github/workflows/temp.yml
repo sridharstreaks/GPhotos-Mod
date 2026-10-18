@@ -1,0 +1,88 @@
+      - name: Sign Patched APKs (use secret or generate temporary keystore)
+        if: steps.check_release.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+
+          # Prepare release filenames (same logic as before)
+          APK_VER="${{ steps.get_apk_ver.outputs.apk_version }}"
+          APK_VER=$(echo "$APK_VER" | sed -e 's/[^0-9.]//g' -e 's/\.*$//')
+          if [ -z "$APK_VER" ]; then
+            APK_VER="build-${{ github.run_number }}"
+          fi
+          OUT_MOD="GPhotos-Mod-v${APK_VER}-mod.apk"
+          OUT_ORIGINAL="GPhotos-Mod-v${APK_VER}-original.apk"
+          echo "RELEASE_APK_MOD=${OUT_MOD}" >> $GITHUB_ENV
+          echo "RELEASE_APK_ORIGINAL=${OUT_ORIGINAL}" >> $GITHUB_ENV
+          echo "RELEASE_VERSION=${APK_VER}" >> $GITHUB_ENV
+
+          # Determine build tools
+          BUILD_TOOLS_DIR=$(ls -d $ANDROID_HOME/build-tools/* | sort -V | tail -n 1)
+
+          # Use provided keystore secret if present, otherwise generate one temporarily
+          if [ -n "${{ secrets.KEYSTORE_BASE64 }}" ]; then
+            echo "Using provided KEYSTORE_BASE64 secret"
+            echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > release.keystore
+            KS_ALIAS="${{ secrets.KEYSTORE_ALIAS || 'gphotosmod' }}"
+            KS_PASS="${{ secrets.KEYSTORE_PASS || 'android' }}"
+            KEY_PASS="${{ secrets.KEY_PASS || 'android' }}"
+          else
+            echo "No KEYSTORE_BASE64 provided — generating new keystore for this run (will print base64 below)."
+            # Generate a new strong RSA keypair (passwords intentionally simple for CI; store securely later)
+            keytool -genkeypair \
+              -alias gphotosmod \
+              -keyalg RSA -keysize 2048 \
+              -validity 10000 \
+              -dname "CN=GPhotos-Mod, OU=CI, O=GPhotos-Mod, L=Internet, S=Internet, C=US" \
+              -keystore release.keystore \
+              -storepass android \
+              -keypass android \
+              -storetype PKCS12
+
+            KS_ALIAS="gphotosmod"
+            KS_PASS="android"
+            KEY_PASS="android"
+
+            # Output base64 so you can save it (copy to repo secret KEYSTORE_BASE64)
+            echo "-----BEGIN RELEASE_KEYSTORE_BASE64-----"
+            base64 -w0 release.keystore || base64 release.keystore
+            echo
+            echo "-----END RELEASE_KEYSTORE_BASE64-----"
+            echo "Copy the base64 blob above and save as repository secret KEYSTORE_BASE64 for future runs."
+          fi
+
+          # Sign each flavor (repack, zipalign, sign)
+          for FLAVOR in mod original; do
+            echo "Processing ${FLAVOR} package..."
+            IN_UNSIGNED="patched-${FLAVOR}-unsigned.apk"
+            if [ ! -f "$IN_UNSIGNED" ]; then
+              echo "Error: input APK not found: $IN_UNSIGNED"
+              exit 1
+            fi
+
+            # 1) Repack to normalize headers
+            python3 .github/scripts/repack_apk.py --input "$IN_UNSIGNED" --output "patched-${FLAVOR}-fixed.apk"
+
+            # 2) Zipalign
+            $BUILD_TOOLS_DIR/zipalign -v -p 4 "patched-${FLAVOR}-fixed.apk" "patched-${FLAVOR}-aligned.apk"
+
+            # 3) Sign (apksigner accepts PKCS12 keystores and JKS)
+            TARGET_OUT=$([ "$FLAVOR" = "mod" ] && echo "$OUT_MOD" || echo "$OUT_ORIGINAL")
+            echo "Signing -> $TARGET_OUT"
+            $BUILD_TOOLS_DIR/apksigner sign \
+              --ks release.keystore \
+              --ks-pass pass:$KS_PASS \
+              --key-pass pass:$KEY_PASS \
+              --ks-key-alias $KS_ALIAS \
+              --out "${TARGET_OUT}" \
+              "patched-${FLAVOR}-aligned.apk"
+
+            # 4) Verify
+            echo "Verifying signature for ${TARGET_OUT}..."
+            $BUILD_TOOLS_DIR/apksigner verify --verbose "${TARGET_OUT}"
+
+            # cleanup intermediate files
+            rm -f "patched-${FLAVOR}-fixed.apk" "patched-${FLAVOR}-aligned.apk"
+          done
+
+          # Remove local keystore file after signing
+          rm -f release.keystore || true
