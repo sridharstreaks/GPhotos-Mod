@@ -244,8 +244,8 @@ public class GitHubReleaseChecker {
     }
 
     private static void showUpdateDialog(final Context context, final String newVersion, final String downloadUrl,
-                                         final String currentVersion, final boolean isRebuild, final long assetTime,
-                                         final String assetName) {
+                                          final String currentVersion, final boolean isRebuild, final long assetTime,
+                                          final String assetName) {
         if (!(context instanceof Activity) || ((Activity) context).isFinishing()) {
             return;
         }
@@ -391,9 +391,6 @@ public class GitHubReleaseChecker {
                 .create();
 
         downloadDialog.show();
-
-        while ((bytesRead = in.read(buffer)) != -1) {
-        }
 
         // High-throughput direct in-process downloader
         new Thread(new Runnable() {
