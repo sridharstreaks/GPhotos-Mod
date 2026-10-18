@@ -1,0 +1,236 @@
+name: Build, Patch and Release GPhotos-Mod
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      direct_apk_url:
+        description: 'Direct APK Download URL (Optional fallback if APKMirror scraping fails)'
+        required: false
+        type: string
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - '**.md'
+
+jobs:
+  build-and-patch:
+    name: Build Patch & Release GPhotos-Mod
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: read
+      actions: write
+    steps:
+      - name: Checkout Release Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Install Python Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install beautifulsoup4 curl_cffi
+
+      - name: Check Latest APKMirror Version
+        id: check_upstream
+        run: |
+          python .github/scripts/download_apk.py --check-version
+
+      - name: Check Existing Release
+        id: check_release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          RAW_VER="${{ steps.check_upstream.outputs.apk_version }}"
+          APK_VER=$(echo "$RAW_VER" | sed -e 's/[^0-9.]//g' -e 's/\.*$//')
+          echo "Latest upstream version found: $APK_VER"
+          if [ -n "$APK_VER" ] && [ "${{ github.event_name }}" = "schedule" ]; then
+            TAG="v${APK_VER}"
+            HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: token $GITHUB_TOKEN" "https://api.github.com/repos/${{ github.repository }}/releases/tags/$TAG")
+            if [ "$HTTP_STATUS" = "200" ]; then
+              echo "Release $TAG already exists in ${{ github.repository }}. Skipping duplicate build."
+              echo "skip=true" >> $GITHUB_OUTPUT
+            fi
+          fi
+
+      - name: Checkout Patches Repository (Morphe Google Photos)
+        if: steps.check_release.outputs.skip != 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: 'Akash-Sriram/morphe-google-photos'
+          path: 'morphe-google-photos'
+
+      - name: Setup Java 21
+        if: steps.check_release.outputs.skip != 'true'
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Cache Gradle
+        if: steps.check_release.outputs.skip != 'true'
+        uses: burrunan/gradle-cache-action@v3
+        with:
+          build-root-directory: morphe-google-photos
+
+      - name: Overlay Custom Patches from GPhotos-Mod into morphe-google-photos
+        if: steps.check_release.outputs.skip != 'true'
+        run: |
+          if [ -d "custom-patches" ]; then
+            echo "Copying custom-patches into morphe-google-photos..."
+            cp -r custom-patches/* morphe-google-photos/
+          fi
+
+      - name: Build Morphe Patches from morphe-google-photos
+        if: steps.check_release.outputs.skip != 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd morphe-google-photos
+          chmod +x gradlew
+          ./gradlew :extensions:shared:syncExtension :patches:buildAndroid generatePatchesList -Pgpr.user=${{ github.actor }} -Pgpr.key=${{ secrets.GITHUB_TOKEN }}
+
+      - name: Locate Patch Bundle
+        if: steps.check_release.outputs.skip != 'true'
+        id: locate_patch
+        run: |
+          PATCH_FILE=$(find morphe-google-photos/patches/build/libs \( -name "patches-*.mpp" -o -name "patches-*.jar" \) | grep -v "\-sources" | grep -v "\-javadoc" | sort -V | tail -n 1)
+          if [ -z "$PATCH_FILE" ]; then
+            echo "Error: Patch file not found!"
+            exit 1
+          fi
+          echo "PATCH_PATH=$PATCH_FILE" >> $GITHUB_ENV
+          echo "Found patch file: $PATCH_FILE"
+
+      - name: Setup Morphe CLI
+        if: steps.check_release.outputs.skip != 'true'
+        run: |
+          CLI_URL=$(curl -s https://api.github.com/repos/MorpheApp/morphe-desktop/releases/latest | grep "browser_download_url.*morphe-desktop.*all.jar" | cut -d '"' -f 4 | head -n 1)
+          if [ -z "$CLI_URL" ]; then
+            CLI_URL="https://github.com/MorpheApp/morphe-desktop/releases/download/v1.16.0/morphe-desktop-1.16.0-all.jar"
+          fi
+          echo "Downloading Morphe Desktop CLI from $CLI_URL"
+          curl -L -o morphe-cli.jar "$CLI_URL"
+
+      - name: Download Google Photos APK
+        if: steps.check_release.outputs.skip != 'true'
+        id: download_apk
+        run: |
+          DIRECT_URL="${{ inputs.direct_apk_url }}"
+          if [ -n "$DIRECT_URL" ]; then
+            python .github/scripts/download_apk.py --direct-url "$DIRECT_URL" --output google-photos-base.apk
+          else
+            python .github/scripts/download_apk.py --retries 3 --output google-photos-base.apk
+          fi
+
+      - name: Extract Actual APK Version
+        if: steps.check_release.outputs.skip != 'true'
+        id: get_apk_ver
+        run: |
+          AAPT_PATH=$(find $ANDROID_HOME/build-tools -name "aapt" | sort -V | tail -n 1)
+          APK_VER=$($AAPT_PATH dump badging google-photos-base.apk | grep -oP "versionName='\K[^']+")
+          echo "Actual APK version extracted: $APK_VER"
+          echo "apk_version=$APK_VER" >> $GITHUB_OUTPUT
+
+      - name: Patch Google Photos APKs (Mod & Original)
+        if: steps.check_release.outputs.skip != 'true'
+        run: |
+          echo "🧩 [1/2] Building Mod Package (com.sridhar.gphotosmod)..."
+          java -jar morphe-cli.jar patch \
+            -f \
+            -p "${{ env.PATCH_PATH }}" \
+            -d "Custom Morphe branding" \
+            -e "Flag manager & Toolkit" \
+            -O components="both" \
+            --unsigned \
+            -o patched-mod-unsigned.apk \
+            google-photos-base.apk
+
+          echo "🧩 [2/2] Building Original Package (com.sridhar.gphotosmod.original)..."
+          java -jar morphe-cli.jar patch \
+            -f \
+            -p "${{ env.PATCH_PATH }}" \
+            -e "Official package name" \
+            -d "Custom Morphe branding" \
+            -e "Flag manager & Toolkit" \
+            -O components="both" \
+            --unsigned \
+            -o patched-original-unsigned.apk \
+            google-photos-base.apk
+
+      - name: Sign Patched APKs
+        if: steps.check_release.outputs.skip != 'true'
+        run: |
+          echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > release.keystore
+
+          APK_VER="${{ steps.get_apk_ver.outputs.apk_version }}"
+          APK_VER=$(echo "$APK_VER" | sed -e 's/[^0-9.]//g' -e 's/\.*$//')
+          if [ -z "$APK_VER" ]; then
+            APK_VER="build-${{ github.run_number }}"
+          fi
+          OUT_MOD="GPhotos-Mod-v${APK_VER}-mod.apk"
+          OUT_ORIGINAL="GPhotos-Mod-v${APK_VER}-original.apk"
+          echo "RELEASE_APK_MOD=${OUT_MOD}" >> $GITHUB_ENV
+          echo "RELEASE_APK_ORIGINAL=${OUT_ORIGINAL}" >> $GITHUB_ENV
+          echo "RELEASE_VERSION=${APK_VER}" >> $GITHUB_ENV
+
+          BUILD_TOOLS_DIR=$(ls -d $ANDROID_HOME/build-tools/* | sort -V | tail -n 1)
+
+          for FLAVOR in mod original; do
+            echo "Processing and signing ${FLAVOR} package..."
+
+            python3 .github/scripts/repack_apk.py --input "patched-${FLAVOR}-unsigned.apk" --output "patched-${FLAVOR}-fixed.apk"
+
+            $BUILD_TOOLS_DIR/zipalign -v -p 4 patched-${FLAVOR}-fixed.apk patched-${FLAVOR}-aligned.apk
+
+            TARGET_OUT=$([ "$FLAVOR" = "mod" ] && echo "$OUT_MOD" || echo "$OUT_ORIGINAL")
+            $BUILD_TOOLS_DIR/apksigner sign --ks release.keystore --ks-pass pass:android --key-pass pass:android --out "${TARGET_OUT}" patched-${FLAVOR}-aligned.apk
+
+            echo "Verifying zipalign for ${TARGET_OUT}..."
+            $BUILD_TOOLS_DIR/zipalign -c -v 4 "${TARGET_OUT}"
+            echo "Verifying signature for ${TARGET_OUT}..."
+            $BUILD_TOOLS_DIR/apksigner verify --verbose "${TARGET_OUT}"
+
+            rm -f patched-${FLAVOR}-fixed.apk patched-${FLAVOR}-aligned.apk
+          done
+
+          rm -f release.keystore
+
+      - name: Upload Mod APK Artifact
+        if: steps.check_release.outputs.skip != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.RELEASE_APK_MOD }}
+          path: ${{ env.RELEASE_APK_MOD }}
+
+      - name: Upload Original APK Artifact
+        if: steps.check_release.outputs.skip != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.RELEASE_APK_ORIGINAL }}
+          path: ${{ env.RELEASE_APK_ORIGINAL }}
+
+      - name: Publish or Update Patched APK Release
+        if: steps.check_release.outputs.skip != 'true' && (github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="v${{ env.RELEASE_VERSION }}"
+          TITLE="GPhotos-Mod v${{ env.RELEASE_VERSION }}"
+          APK_MOD="${{ env.RELEASE_APK_MOD }}"
+          APK_ORIGINAL="${{ env.RELEASE_APK_ORIGINAL }}"
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG exists. Overwriting APK assets..."
+            gh release upload "$TAG" "$APK_MOD" "$APK_ORIGINAL" --clobber
+            gh release edit "$TAG" --title "$TITLE" --latest
+          else
+            echo "Creating new release $TAG..."
+            gh release create "$TAG" "$APK_MOD" "$APK_ORIGINAL" --title "$TITLE" --latest
+          fi
