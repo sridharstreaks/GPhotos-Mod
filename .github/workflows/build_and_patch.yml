@@ -179,26 +179,47 @@ jobs:
           echo "RELEASE_VERSION=${APK_VER}" >> $GITHUB_ENV
           echo "Prepared release filenames: $OUT_MOD , $OUT_ORIGINAL"
 
-      - name: Sign Patched APKs (use secret or generate temporary keystore)
+      - name: Sign Patched APKs (safe decode + verify keystore)
         if: steps.check_release.outputs.skip != 'true'
         run: |
           set -euo pipefail
 
+          # recompute filenames so step is self-contained
           APK_VER="${{ steps.get_apk_ver.outputs.apk_version }}"
           APK_VER=$(echo "$APK_VER" | sed -e 's/[^0-9.]//g' -e 's/\.*$//')
           if [ -z "$APK_VER" ]; then
             APK_VER="build-${{ github.run_number }}"
           fi
-
           OUT_MOD="GPhotos-Mod-v${APK_VER}-mod.apk"
           OUT_ORIGINAL="GPhotos-Mod-v${APK_VER}-original.apk"
 
+          # choose keystore: provided secret or generate one temporarily
           if [ -n "${{ secrets.KEYSTORE_BASE64 }}" ]; then
-            echo "Using provided KEYSTORE_BASE64 secret"
-            echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > release.keystore
+            echo "Decoding provided KEYSTORE_BASE64 into release.keystore (using printf -> base64 -d)..."
+            printf '%s' "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > release.keystore || {
+              echo "ERROR: base64 decode failed. The KEYSTORE_BASE64 secret may be corrupted or not valid base64."
+              exit 2
+            }
+
+            echo "Verifying keystore with keytool..."
+            if ! keytool -list -keystore release.keystore -storepass android -storetype PKCS12 >/dev/null 2>&1; then
+              echo "ERROR: keytool failed to read the decoded keystore (PKCS12)."
+              echo "Possible causes:"
+              echo " - The KEYSTORE_BASE64 secret is corrupt (copied incorrectly)."
+              echo " - The keystore uses an unsupported format/structure."
+              echo
+              echo "If you created the secret by base64-encoding a file, recreate it locally with:"
+              echo "  base64 -w0 release.keystore"
+              echo "and paste the output into the KEYSTORE_BASE64 repository secret."
+              echo
+              echo "Alternatively convert your keystore locally to a JDK-friendly PKCS12/JKS (see guidance in workflow README)."
+              exit 3
+            fi
+
             KS_ALIAS="${{ secrets.KEYSTORE_ALIAS || 'gphotosmod' }}"
             KS_PASS="${{ secrets.KEYSTORE_PASS || 'android' }}"
             KEY_PASS="${{ secrets.KEY_PASS || 'android' }}"
+
           else
             echo "No KEYSTORE_BASE64 provided — generating new keystore for this run (will print base64 below)."
             keytool -genkeypair \
@@ -270,7 +291,7 @@ jobs:
           path: ${{ env.RELEASE_APK_ORIGINAL }}
 
       - name: Publish or Update Patched APK Release
-        if: steps.check_release.outputs.skip != 'true' && (github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule')
+        if: steps.check_release.outputs.skip != 'git' && (github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule')
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -284,6 +305,6 @@ jobs:
             gh release upload "$TAG" "$APK_MOD" "$APK_ORIGINAL" --clobber
             gh release edit "$TAG" --title "$TITLE" --latest
           else
-            echo "Creating new release $TAG..."
+            echo "Create new release $TAG..."
             gh release create "$TAG" "$APK_MOD" "$APK_ORIGINAL" --title "$TITLE" --latest
           fi
