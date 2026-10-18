@@ -2,7 +2,7 @@ name: Build, Patch and Release GPhotos-Mod
 
 on:
   schedule:
-    - cron: '0 */6 * * *'
+    - cron: '0 */6 * * *'  # Runs automatically every 6 hours
   workflow_dispatch:
     inputs:
       direct_apk_url:
@@ -164,11 +164,9 @@ jobs:
             -o patched-original-unsigned.apk \
             google-photos-base.apk
 
-      - name: Sign Patched APKs
+      - name: Prepare release filenames
         if: steps.check_release.outputs.skip != 'true'
         run: |
-          echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > release.keystore
-
           APK_VER="${{ steps.get_apk_ver.outputs.apk_version }}"
           APK_VER=$(echo "$APK_VER" | sed -e 's/[^0-9.]//g' -e 's/\.*$//')
           if [ -z "$APK_VER" ]; then
@@ -179,28 +177,74 @@ jobs:
           echo "RELEASE_APK_MOD=${OUT_MOD}" >> $GITHUB_ENV
           echo "RELEASE_APK_ORIGINAL=${OUT_ORIGINAL}" >> $GITHUB_ENV
           echo "RELEASE_VERSION=${APK_VER}" >> $GITHUB_ENV
+          echo "Prepared release filenames: $OUT_MOD , $OUT_ORIGINAL"
+
+      - name: Sign Patched APKs (use secret or generate temporary keystore)
+        if: steps.check_release.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+
+          if [ -n "${{ secrets.KEYSTORE_BASE64 }}" ]; then
+            echo "Using provided KEYSTORE_BASE64 secret"
+            echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > release.keystore
+            KS_ALIAS="${{ secrets.KEYSTORE_ALIAS || 'gphotosmod' }}"
+            KS_PASS="${{ secrets.KEYSTORE_PASS || 'android' }}"
+            KEY_PASS="${{ secrets.KEY_PASS || 'android' }}"
+          else
+            echo "No KEYSTORE_BASE64 provided — generating new keystore for this run (will print base64 below)."
+            keytool -genkeypair \
+              -alias gphotosmod \
+              -keyalg RSA -keysize 2048 \
+              -validity 10000 \
+              -dname "CN=GPhotos-Mod, OU=CI, O=GPhotos-Mod, L=Internet, S=Internet, C=US" \
+              -keystore release.keystore \
+              -storepass android \
+              -keypass android \
+              -storetype PKCS12
+
+            KS_ALIAS="gphotosmod"
+            KS_PASS="android"
+            KEY_PASS="android"
+
+            echo "-----BEGIN RELEASE_KEYSTORE_BASE64-----"
+            base64 -w0 release.keystore || base64 release.keystore
+            echo
+            echo "-----END RELEASE_KEYSTORE_BASE64-----"
+            echo "Copy the base64 blob above and save as repository secret KEYSTORE_BASE64 for future runs."
+          fi
 
           BUILD_TOOLS_DIR=$(ls -d $ANDROID_HOME/build-tools/* | sort -V | tail -n 1)
 
           for FLAVOR in mod original; do
-            echo "Processing and signing ${FLAVOR} package..."
+            echo "Processing ${FLAVOR} package..."
 
-            python3 .github/scripts/repack_apk.py --input "patched-${FLAVOR}-unsigned.apk" --output "patched-${FLAVOR}-fixed.apk"
+            IN_UNSIGNED="patched-${FLAVOR}-unsigned.apk"
+            if [ ! -f "$IN_UNSIGNED" ]; then
+              echo "Error: input APK not found: $IN_UNSIGNED"
+              exit 1
+            fi
 
-            $BUILD_TOOLS_DIR/zipalign -v -p 4 patched-${FLAVOR}-fixed.apk patched-${FLAVOR}-aligned.apk
+            python3 .github/scripts/repack_apk.py --input "$IN_UNSIGNED" --output "patched-${FLAVOR}-fixed.apk"
+
+            $BUILD_TOOLS_DIR/zipalign -v -p 4 "patched-${FLAVOR}-fixed.apk" "patched-${FLAVOR}-aligned.apk"
 
             TARGET_OUT=$([ "$FLAVOR" = "mod" ] && echo "$OUT_MOD" || echo "$OUT_ORIGINAL")
-            $BUILD_TOOLS_DIR/apksigner sign --ks release.keystore --ks-pass pass:android --key-pass pass:android --out "${TARGET_OUT}" patched-${FLAVOR}-aligned.apk
+            echo "Signing -> $TARGET_OUT"
+            $BUILD_TOOLS_DIR/apksigner sign \
+              --ks release.keystore \
+              --ks-pass pass:$KS_PASS \
+              --key-pass pass:$KEY_PASS \
+              --ks-key-alias $KS_ALIAS \
+              --out "${TARGET_OUT}" \
+              "patched-${FLAVOR}-aligned.apk"
 
-            echo "Verifying zipalign for ${TARGET_OUT}..."
-            $BUILD_TOOLS_DIR/zipalign -c -v 4 "${TARGET_OUT}"
             echo "Verifying signature for ${TARGET_OUT}..."
             $BUILD_TOOLS_DIR/apksigner verify --verbose "${TARGET_OUT}"
 
-            rm -f patched-${FLAVOR}-fixed.apk patched-${FLAVOR}-aligned.apk
+            rm -f "patched-${FLAVOR}-fixed.apk" "patched-${FLAVOR}-aligned.apk"
           done
 
-          rm -f release.keystore
+          rm -f release.keystore || true
 
       - name: Upload Mod APK Artifact
         if: steps.check_release.outputs.skip != 'true'
