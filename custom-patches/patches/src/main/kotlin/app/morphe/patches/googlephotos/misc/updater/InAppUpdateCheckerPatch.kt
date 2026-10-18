@@ -29,7 +29,7 @@ val inAppUpdateCheckerResourcePatch = resourcePatch {
 val inAppUpdateCheckerPatch = bytecodePatch(
     name = "Enable in-app update checker",
     description = "Checks for newer patched Google Photos releases on GitHub and prompts to update.",
-    default = true,
+    default = false,
 ) {
     compatibleWith(AppCompatibilities.GOOGLE_PHOTOS)
     dependsOn(inAppUpdateCheckerResourcePatch)
@@ -44,12 +44,8 @@ val inAppUpdateCheckerPatch = bytecodePatch(
     )
 
     execute {
-        HomeActivityOnCreateFingerprint.method.addInstructions(
-            0,
-            """
-                const-string v0, "$releaseApiUrl"
-                invoke-static {p0, v0}, Lapp/morphe/extension/shared/updater/GitHubReleaseChecker;->checkUpdateOnStartup(Landroid/content/Context;Ljava/lang/String;)V
-            """.trimIndent()
-        )
+        // TODO: Re-enable once the matching Google Photos HomeActivity fingerprint is available.
+        // The custom patch should inject a call into HomeActivity#onCreate here when the
+        // upstream fingerprint is defined in this project.
     }
 }
