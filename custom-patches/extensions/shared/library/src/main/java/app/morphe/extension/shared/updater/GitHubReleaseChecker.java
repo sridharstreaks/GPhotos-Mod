@@ -43,7 +43,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 public class GitHubReleaseChecker {
 
-    private static final String REPO_RELEASES_URL = "https://api.github.com/repos/Akash-Sriram/GooglePhotos-Patched/releases/latest";
+    private static final String REPO_RELEASES_URL = "https://api.github.com/repos/Akash-Sriram/GPhotos-Mod-Patched/releases/latest";
     private static boolean hasCheckedThisSession = false;
 
     public static void checkUpdateOnStartup(final Context context) {
@@ -67,7 +67,7 @@ public class GitHubReleaseChecker {
                     URL url = new URL(targetUrl);
                     HttpURLConnection conn = (HttpURLConnection) url.openConnection();
                     conn.setRequestMethod("GET");
-                    conn.setRequestProperty("User-Agent", "GooglePhotos-Patched-App");
+                    conn.setRequestProperty("User-Agent", "GPhotos-Mod-Patched-App");
                     conn.setConnectTimeout(10000);
                     conn.setReadTimeout(10000);
 
@@ -252,15 +252,15 @@ public class GitHubReleaseChecker {
 
         String displayName = (assetName != null && !assetName.isEmpty())
                 ? assetName
-                : ("GooglePhotos-v" + newVersion + ".apk");
+                : ("GPhotos-Mod-v" + newVersion + ".apk");
 
         String message;
         if (isRebuild) {
-            message = "An updated build of Google Photos (v" + newVersion + ") is available.\n\n" +
+            message = "An updated build of GPhotos-Mod (v" + newVersion + ") is available.\n\n" +
                       "Package: " + displayName + "\n\n" +
                       "Would you like to download and install this latest build?";
         } else {
-            message = "A new patched version of Google Photos is available.\n\n" +
+            message = "A new patched version of GPhotos-Mod is available.\n\n" +
                       "Installed version: " + currentVersion + "\n" +
                       "Latest version: " + newVersion + "\n" +
                       "Package: " + displayName + "\n\n" +
@@ -281,7 +281,7 @@ public class GitHubReleaseChecker {
                         if (!canInstall) {
                             new AlertDialog.Builder(context, getDialogTheme(context))
                                     .setTitle("Permission Required")
-                                    .setMessage("Google Photos requires permission to install updates.\n\nPlease allow 'Install unknown apps' in the next screen, then tap Update again.")
+                                    .setMessage("GPhotos-Mod requires permission to install updates.\n\nPlease allow 'Install unknown apps' in the next screen, then tap Update again.")
                                     .setPositiveButton("Settings", (d, w) -> {
                                         try {
                                             Intent settingsIntent = new Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES);
@@ -314,7 +314,7 @@ public class GitHubReleaseChecker {
 
         final String apkFileName = (assetName != null && !assetName.isEmpty())
                 ? assetName
-                : ("GooglePhotos-v" + version + "-patched.apk");
+                : ("GPhotos-Mod-v" + version + "-patched.apk");
 
         final float density = context.getResources().getDisplayMetrics().density;
         final int pad20 = (int) (20 * density);
@@ -420,7 +420,7 @@ public class GitHubReleaseChecker {
                         conn = (HttpURLConnection) url.openConnection();
                         conn.setInstanceFollowRedirects(false);
                         conn.setRequestMethod("GET");
-                        conn.setRequestProperty("User-Agent", "Mozilla/5.0 (Android; Mobile) GooglePhotos-Patched-Updater");
+                        conn.setRequestProperty("User-Agent", "Mozilla/5.0 (Android; Mobile) GPhotos-Mod-Patched-Updater");
                         conn.setRequestProperty("Accept-Encoding", "identity");
                         conn.setRequestProperty("Connection", "keep-alive");
                         conn.setConnectTimeout(15000);
@@ -641,7 +641,7 @@ public class GitHubReleaseChecker {
                 if (!canInstall) {
                     new AlertDialog.Builder(context, getDialogTheme(context))
                             .setTitle("Permission Required")
-                            .setMessage("Google Photos requires permission to install updates.\n\nPlease allow 'Install unknown apps' in the next screen, then tap Update again.")
+                            .setMessage("GPhotos-Mod requires permission to install updates.\n\nPlease allow 'Install unknown apps' in the next screen, then tap Update again.")
                             .setPositiveButton("Settings", (dialog, which) -> {
                                 try {
                                     Intent settingsIntent = new Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES);
@@ -751,7 +751,7 @@ public class GitHubReleaseChecker {
                 File[] files = downloadDir.listFiles();
                 if (files != null) {
                     for (File file : files) {
-                        if (file.isFile() && file.getName().startsWith("GooglePhotos-") && file.getName().endsWith(".apk")) {
+                        if (file.isFile() && file.getName().startsWith("GPhotos-Mod-") && file.getName().endsWith(".apk")) {
                             file.delete();
                         }
                     }
