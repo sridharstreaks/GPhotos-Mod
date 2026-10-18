@@ -2,7 +2,7 @@ name: Build, Patch and Release GPhotos-Mod
 
 on:
   schedule:
-    - cron: '0 */6 * * *'  # Runs automatically every 6 hours
+    - cron: '0 0 * * 0'
   workflow_dispatch:
     inputs:
       direct_apk_url:
@@ -36,6 +36,75 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install beautifulsoup4 curl_cffi
+
+      - name: Generate launcher icons from source
+        if: steps.check_release.outputs.skip != 'true' || always()
+        run: |
+          set -euo pipefail
+
+          ICON_SRC=".github/icons/icon.png"
+          if [ ! -f "$ICON_SRC" ]; then
+            echo "No icon source found at $ICON_SRC — skipping icon generation."
+            echo "To enable icon generation, add your source PNG to $ICON_SRC and re-run."
+            exit 0
+          fi
+
+          echo "Installing ImageMagick..."
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq imagemagick
+
+          RESDIR="morphe-google-photos/app/src/main/res"
+          echo "Creating resource directories under $RESDIR"
+          mkdir -p "$RESDIR/mipmap-mdpi" "$RESDIR/mipmap-hdpi" "$RESDIR/mipmap-xhdpi" "$RESDIR/mipmap-xxhdpi" "$RESDIR/mipmap-xxxhdpi" "$RESDIR/mipmap-anydpi-v26" "$RESDIR/values"
+
+          # Legacy launcher icon sizes (px)
+          # mdpi 48, hdpi 72, xhdpi 96, xxhdpi 144, xxxhdpi 192
+          echo "Generating legacy mipmap icons..."
+          convert "$ICON_SRC" -background none -gravity center -resize 48x48^ -extent 48x48 "$RESDIR/mipmap-mdpi/ic_launcher.png"
+          convert "$ICON_SRC" -background none -gravity center -resize 72x72^ -extent 72x72 "$RESDIR/mipmap-hdpi/ic_launcher.png"
+          convert "$ICON_SRC" -background none -gravity center -resize 96x96^ -extent 96x96 "$RESDIR/mipmap-xhdpi/ic_launcher.png"
+          convert "$ICON_SRC" -background none -gravity center -resize 144x144^ -extent 144x144 "$RESDIR/mipmap-xxhdpi/ic_launcher.png"
+          convert "$ICON_SRC" -background none -gravity center -resize 192x192^ -extent 192x192 "$RESDIR/mipmap-xxxhdpi/ic_launcher.png"
+
+          # Round icons (copy same images to ic_launcher_round)
+          for d in mipmap-mdpi mipmap-hdpi mipmap-xhdpi mipmap-xxhdpi mipmap-xxxhdpi; do
+            cp "$RESDIR/$d/ic_launcher.png" "$RESDIR/$d/ic_launcher_round.png"
+          done
+
+          # Adaptive icon foreground (high-res). Use a large canvas so Android can scale down cleanly.
+          # We'll create a 432x432 foreground PNG (big) and let the adaptive XML reference it.
+          echo "Generating adaptive foreground..."
+          convert "$ICON_SRC" -background none -gravity center -resize 432x432^ -extent 432x432 "$RESDIR/mipmap-anydpi-v26/ic_launcher_foreground.png"
+
+          # Also create a scaled anydpi foreground to be safe
+          convert "$ICON_SRC" -background none -gravity center -resize 108x108^ -extent 108x108 "$RESDIR/mipmap-anydpi-v26/ic_launcher_foreground_small.png"
+
+          # Adaptive icon XML (foreground + background color)
+          cat > "$RESDIR/mipmap-anydpi-v26/ic_launcher.xml" <<'XML'
+          <?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+            <background android:drawable="@color/ic_launcher_background"/>
+            <foreground android:drawable="@mipmap/ic_launcher_foreground"/>
+          </adaptive-icon>
+          XML
+          
+                    cat > "$RESDIR/mipmap-anydpi-v26/ic_launcher_round.xml" <<'XML'
+          <?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+            <background android:drawable="@color/ic_launcher_background"/>
+            <foreground android:drawable="@mipmap/ic_launcher_foreground"/>
+          </adaptive-icon>
+          XML
+
+          # Provide a simple background color resource (modify hex if you want another color)
+          cat > "$RESDIR/values/colors.xml" <<'XML'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <color name="ic_launcher_background">#FFFFFFFF</color>
+          </resources>
+          XML
+
+          echo "Icon generation completed and resources placed under $RESDIR."
 
       - name: Check Latest APKMirror Version
         id: check_upstream
@@ -184,7 +253,6 @@ jobs:
         run: |
           set -euo pipefail
 
-          # recompute filenames so step is self-contained
           APK_VER="${{ steps.get_apk_ver.outputs.apk_version }}"
           APK_VER=$(echo "$APK_VER" | sed -e 's/[^0-9.]//g' -e 's/\.*$//')
           if [ -z "$APK_VER" ]; then
@@ -193,7 +261,6 @@ jobs:
           OUT_MOD="GPhotos-Mod-v${APK_VER}-mod.apk"
           OUT_ORIGINAL="GPhotos-Mod-v${APK_VER}-original.apk"
 
-          # choose keystore: provided secret or generate one temporarily
           if [ -n "${{ secrets.KEYSTORE_BASE64 }}" ]; then
             echo "Decoding provided KEYSTORE_BASE64 into release.keystore (using printf -> base64 -d)..."
             printf '%s' "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > release.keystore || {
@@ -204,22 +271,12 @@ jobs:
             echo "Verifying keystore with keytool..."
             if ! keytool -list -keystore release.keystore -storepass android -storetype PKCS12 >/dev/null 2>&1; then
               echo "ERROR: keytool failed to read the decoded keystore (PKCS12)."
-              echo "Possible causes:"
-              echo " - The KEYSTORE_BASE64 secret is corrupt (copied incorrectly)."
-              echo " - The keystore uses an unsupported format/structure."
-              echo
-              echo "If you created the secret by base64-encoding a file, recreate it locally with:"
-              echo "  base64 -w0 release.keystore"
-              echo "and paste the output into the KEYSTORE_BASE64 repository secret."
-              echo
-              echo "Alternatively convert your keystore locally to a JDK-friendly PKCS12/JKS (see guidance in workflow README)."
               exit 3
             fi
 
             KS_ALIAS="${{ secrets.KEYSTORE_ALIAS || 'gphotosmod' }}"
             KS_PASS="${{ secrets.KEYSTORE_PASS || 'android' }}"
             KEY_PASS="${{ secrets.KEY_PASS || 'android' }}"
-
           else
             echo "No KEYSTORE_BASE64 provided — generating new keystore for this run (will print base64 below)."
             keytool -genkeypair \
@@ -291,7 +348,7 @@ jobs:
           path: ${{ env.RELEASE_APK_ORIGINAL }}
 
       - name: Publish or Update Patched APK Release
-        if: steps.check_release.outputs.skip != 'git' && (github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule')
+        if: steps.check_release.outputs.skip != 'true' && (github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule')
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -305,6 +362,6 @@ jobs:
             gh release upload "$TAG" "$APK_MOD" "$APK_ORIGINAL" --clobber
             gh release edit "$TAG" --title "$TITLE" --latest
           else
-            echo "Create new release $TAG..."
+            echo "Creating new release $TAG..."
             gh release create "$TAG" "$APK_MOD" "$APK_ORIGINAL" --title "$TITLE" --latest
           fi
