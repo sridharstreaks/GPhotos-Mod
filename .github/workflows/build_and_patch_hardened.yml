@@ -1,7 +1,5 @@
-# Hardened CI: Generate icons, verify morphe CLI, patch, sign with keystore from secrets, upload artifacts, gated publish.
-name: Hardened Build, Patch & Release (secure)
+name: Hardened Build, Patch & Release (secure, heredoc fixed)
 
-# least privilege by default
 permissions:
   contents: read
   packages: read
@@ -18,13 +16,12 @@ on:
     branches:
       - main
   schedule:
-    - cron: '0 3 * * *'  # optional daily run; adjust or remove as desired
+    - cron: '0 3 * * *'
 
 env:
   MORPHE_DIR: morphe-google-photos
   APP_RES: morphe-google-photos/app/src/main/res
   ICON_SRC: .github/icons/icon.png
-  # Default pinned Morphe CLI (change URL if you want another pinned release)
   MORPHE_CLI_URL: https://github.com/MorpheApp/morphe-desktop/releases/download/v1.18.1/morphe-desktop-1.18.1-all.jar
 
 jobs:
@@ -74,35 +71,32 @@ jobs:
             exit 1
           fi
 
-      - name: Generate launcher icons from provided icon (if present)
+      - name: Generate launcher icons from provided icon (fixed)
         run: |
           set -euo pipefail
           if [ -f "${{ env.ICON_SRC }}" ]; then
             sudo apt-get update -qq
             sudo apt-get install -y -qq imagemagick
             mkdir -p "${{ env.APP_RES }}/mipmap-mdpi" "${{ env.APP_RES }}/mipmap-hdpi" "${{ env.APP_RES }}/mipmap-xhdpi" "${{ env.APP_RES }}/mipmap-xxhdpi" "${{ env.APP_RES }}/mipmap-xxxhdpi" "${{ env.APP_RES }}/mipmap-anydpi-v26" "${{ env.APP_RES }}/values"
+
             convert "${{ env.ICON_SRC }}" -background none -gravity center -resize 48x48^ -extent 48x48 "${{ env.APP_RES }}/mipmap-mdpi/ic_launcher.png"
             convert "${{ env.ICON_SRC }}" -background none -gravity center -resize 72x72^ -extent 72x72 "${{ env.APP_RES }}/mipmap-hdpi/ic_launcher.png"
             convert "${{ env.ICON_SRC }}" -background none -gravity center -resize 96x96^ -extent 96x96 "${{ env.APP_RES }}/mipmap-xhdpi/ic_launcher.png"
             convert "${{ env.ICON_SRC }}" -background none -gravity center -resize 144x144^ -extent 144x144 "${{ env.APP_RES }}/mipmap-xxhdpi/ic_launcher.png"
             convert "${{ env.ICON_SRC }}" -background none -gravity center -resize 192x192^ -extent 192x192 "${{ env.APP_RES }}/mipmap-xxxhdpi/ic_launcher.png"
+
             for d in mipmap-mdpi mipmap-hdpi mipmap-xhdpi mipmap-xxhdpi mipmap-xxxhdpi; do
               cp "${{ env.APP_RES }}/$d/ic_launcher.png" "${{ env.APP_RES }}/$d/ic_launcher_round.png"
             done
+
             convert "${{ env.ICON_SRC }}" -background none -gravity center -resize 432x432^ -extent 432x432 "${{ env.APP_RES }}/mipmap-anydpi-v26/ic_launcher_foreground.png"
-            cat > "${{ env.APP_RES }}/mipmap-anydpi-v26/ic_launcher.xml" <<'XML'
-            <?xml version="1.0" encoding="utf-8"?>
-            <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
-              <background android:drawable="@color/ic_launcher_background"/>
-              <foreground android:drawable="@mipmap/ic_launcher_foreground"/>
-            </adaptive-icon>
-            XML
-                        cat > "${{ env.APP_RES }}/values/colors.xml" <<'XML'
-            <?xml version="1.0" encoding="utf-8"?>
-            <resources>
-              <color name="ic_launcher_background">#FFFFFFFF</color>
-            </resources>
-            XML
+
+            # write adaptive icon XML and color file using printf (avoids heredoc indentation issues)
+            printf '%s\n' '<?xml version="1.0" encoding="utf-8"?>' '<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">' '  <background android:drawable="@color/ic_launcher_background"/>' '  <foreground android:drawable="@mipmap/ic_launcher_foreground"/>' '</adaptive-icon>' > "${{ env.APP_RES }}/mipmap-anydpi-v26/ic_launcher.xml"
+
+            printf '%s\n' '<?xml version="1.0" encoding="utf-8"?>' '<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">' '  <background android:drawable="@color/ic_launcher_background"/>' '  <foreground android:drawable="@mipmap/ic_launcher_foreground"/>' '</adaptive-icon>' > "${{ env.APP_RES }}/mipmap-anydpi-v26/ic_launcher_round.xml"
+
+            printf '%s\n' '<?xml version="1.0" encoding="utf-8"?>' '<resources>' '  <color name="ic_launcher_background">#FFFFFFFF</color>' '</resources>' > "${{ env.APP_RES }}/values/colors.xml"
           else
             echo "Icon source not found at $ICON_SRC — continuing without icon generation."
           fi
