@@ -1,4 +1,4 @@
-name: Hardened Build, Patch & Release (fixed release output)
+name: Hardened Build, Patch & Release (fixed release output + safe keystore decode)
 
 permissions:
   contents: read
@@ -167,11 +167,22 @@ jobs:
 
       - name: Decode keystore safely and verify (no printing)
         run: |
-          set -euo pipefail
-          printf '%s' "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > release.keystore
-          KS_PASS="${{ secrets.KEYSTORE_PASS || 'android' }}"
+          set -eo pipefail
+          # Safely decode the KEYSTORE_BASE64 secret and verify without using 'set -u'
+          if [ -z "${{ secrets.KEYSTORE_BASE64 }}" ]; then
+            echo "ERROR: KEYSTORE_BASE64 secret is empty or missing."
+            exit 1
+          fi
+          printf '%s' "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > release.keystore || {
+            echo "ERROR: base64 decode failed. Ensure KEYSTORE_BASE64 is a single-line base64 of a valid keystore."
+            exit 1
+          }
+          # KS_PASS defaults to 'android' if secret is empty or unset
+          KS_PASS="${{ secrets.KEYSTORE_PASS || '' }}"
+          KS_PASS="${KS_PASS:-android}"
+          # Verify keystore is readable by keytool (assume PKCS12/JKS acceptable to keytool)
           if ! keytool -list -keystore release.keystore -storepass "$KS_PASS" >/dev/null 2>&1; then
-            echo "ERROR: keystore verification failed (invalid base64, password, or unsupported keystore format)."
+            echo "ERROR: keystore verification failed (invalid base64, wrong password, or unsupported keystore format)."
             exit 1
           fi
 
