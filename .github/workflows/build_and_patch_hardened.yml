@@ -1,4 +1,4 @@
-name: Hardened Build, Patch & Release (secure, heredoc fixed)
+name: Hardened Build, Patch & Release (fixed release output)
 
 permissions:
   contents: read
@@ -29,6 +29,8 @@ jobs:
     name: Build, Patch & Sign (secure)
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    outputs:
+      release_version: ${{ steps.prepare_names.outputs.release_version }}
     steps:
       - name: Checkout repository (no credentials)
         uses: actions/checkout@v4
@@ -91,7 +93,6 @@ jobs:
 
             convert "${{ env.ICON_SRC }}" -background none -gravity center -resize 432x432^ -extent 432x432 "${{ env.APP_RES }}/mipmap-anydpi-v26/ic_launcher_foreground.png"
 
-            # write adaptive icon XML and color file using printf (avoids heredoc indentation issues)
             printf '%s\n' '<?xml version="1.0" encoding="utf-8"?>' '<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">' '  <background android:drawable="@color/ic_launcher_background"/>' '  <foreground android:drawable="@mipmap/ic_launcher_foreground"/>' '</adaptive-icon>' > "${{ env.APP_RES }}/mipmap-anydpi-v26/ic_launcher.xml"
 
             printf '%s\n' '<?xml version="1.0" encoding="utf-8"?>' '<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">' '  <background android:drawable="@color/ic_launcher_background"/>' '  <foreground android:drawable="@mipmap/ic_launcher_foreground"/>' '</adaptive-icon>' > "${{ env.APP_RES }}/mipmap-anydpi-v26/ic_launcher_round.xml"
@@ -162,7 +163,7 @@ jobs:
           OUT_ORIG="GPhotos-Mod-v${APK_VER}-original.apk"
           echo "RELEASE_APK_MOD=$OUT_MOD" >> $GITHUB_ENV
           echo "RELEASE_APK_ORIGINAL=$OUT_ORIG" >> $GITHUB_ENV
-          echo "RELEASE_VERSION=$APK_VER" >> $GITHUB_ENV
+          echo "release_version=$APK_VER" >> $GITHUB_OUTPUT
 
       - name: Decode keystore safely and verify (no printing)
         run: |
@@ -233,8 +234,14 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          TAG="v${{ env.RELEASE_VERSION }}"
-          if [ -z "$TAG" ]; then TAG="v${{ github.run_number }}"; fi
+          # Read the release version produced by the build job safely
+          BUILD_VER="${{ needs.build.outputs.release_version || '' }}"
+          if [ -z "$BUILD_VER" ]; then
+            BUILD_VER="${{ github.run_number }}"
+          fi
+          TAG="v${BUILD_VER}"
+          echo "Creating/updating release with tag: $TAG"
+
           MOD=$(ls ./release-artifacts | grep -i 'mod\.apk' | head -n1)
           ORIG=$(ls ./release-artifacts | grep -i 'original\.apk' | head -n1)
           if gh release view "$TAG" >/dev/null 2>&1; then
