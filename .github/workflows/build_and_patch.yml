@@ -416,14 +416,14 @@ jobs:
 
       - name: Upload Mod APK Artifact
         if: ${{ steps.check_release.outputs.skip != 'true' }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ env.RELEASE_APK_MOD }}
           path: ${{ env.RELEASE_APK_MOD }}
 
       - name: Upload Original APK Artifact
         if: ${{ steps.check_release.outputs.skip != 'true' }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ env.RELEASE_APK_ORIGINAL }}
           path: ${{ env.RELEASE_APK_ORIGINAL }}
