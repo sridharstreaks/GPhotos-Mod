@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
 Download Google Photos APK from APKMirror.
-Strategy:
-  1. Fast path: curl_cffi with Chrome TLS impersonation (no overhead).
-  2. Fallback: Playwright headless Chromium — executes the real Cloudflare JS
-     challenge and carries the resulting cookies through all APKMirror steps.
+
+Hardened notes:
+- Only allow HTTPS APKMirror URLs for manual direct downloads.
+- Validate output before treating it as a real APK.
+- Fail fast on suspicious or truncated files.
+- Keep the fallback Playwright logic but do not write untrusted content silently.
 """
 import sys
 import os
@@ -13,6 +15,7 @@ import argparse
 import urllib.parse
 import json
 import time
+import zipfile
 
 try:
     from curl_cffi import requests as cffi_requests
@@ -47,12 +50,60 @@ HEADERS = {
     ),
 }
 
+MAX_DOWNLOAD_BYTES = 500 * 1024 * 1024
+MIN_APK_SIZE_BYTES = 1_000_000
+
+# ---------------------------------------------------------------------------
+# Security helpers
+# ---------------------------------------------------------------------------
+
+
+def _validate_direct_url(url: str) -> str:
+    """Allow only HTTPS APKMirror URLs for manual direct input."""
+    if not url:
+        raise ValueError("URL is empty")
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme != "https":
+        raise ValueError("Only HTTPS URLs are allowed.")
+    if "apkmirror.com" not in parsed.netloc.lower():
+        raise ValueError("Only APKMirror URLs are allowed.")
+    return url
+
+
+def _ensure_parent_dir(path: str) -> None:
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+
+def _validate_apk_file(path: str, min_size_bytes: int = MIN_APK_SIZE_BYTES) -> None:
+    """Ensure the file is a real ZIP/APK and not a tiny or truncated download."""
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"APK not found: {path}")
+    size = os.path.getsize(path)
+    if size < min_size_bytes:
+        raise ValueError(f"Downloaded APK too small: {size} bytes (< {min_size_bytes})")
+    if not zipfile.is_zipfile(path):
+        raise ValueError(f"Downloaded file is not a valid ZIP/APK: {path}")
+
+    try:
+        with zipfile.ZipFile(path, "r") as zf:
+            names = zf.namelist()
+            if not names:
+                raise ValueError("APK archive is empty.")
+            if not any(name.endswith("AndroidManifest.xml") for name in names):
+                raise ValueError("APK archive does not look like an Android APK.")
+    except zipfile.BadZipFile as exc:
+        raise ValueError(f"Downloaded APK is corrupted: {exc}") from exc
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _cffi_get(url, headers, stream=False):
-    resp = cffi_requests.get(url, headers=headers, impersonate=IMPERSONATE, stream=stream)
+    resp = cffi_requests.get(url, headers=headers, impersonate=IMPERSONATE, stream=stream, timeout=30)
     resp.raise_for_status()
     return resp
 
@@ -65,21 +116,30 @@ def fetch_url(url, extra_headers=None):
         return _cffi_get(url, headers).content
     import urllib.request
     req = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(req) as resp:
+    with urllib.request.urlopen(req, timeout=30) as resp:
         return resp.read()
 
 
 def _stream_to_file(resp, output_path):
+    _ensure_parent_dir(output_path)
+    downloaded = 0
     with open(output_path, "wb") as fh:
         for chunk in resp.iter_content(chunk_size=8192):
-            if chunk:
-                fh.write(chunk)
+            if not chunk:
+                continue
+            downloaded += len(chunk)
+            if downloaded > MAX_DOWNLOAD_BYTES:
+                raise ValueError(f"Downloaded APK exceeds safe limit ({MAX_DOWNLOAD_BYTES} bytes)")
+            fh.write(chunk)
 
 
 def download_file(url, output_path, extra_headers=None):
+    url = _validate_direct_url(url)
     headers = HEADERS.copy()
     if extra_headers:
         headers.update(extra_headers)
+
+    _ensure_parent_dir(output_path)
 
     if HAS_CURL_CFFI:
         resp = _cffi_get(url, headers, stream=True)
@@ -97,26 +157,33 @@ def download_file(url, output_path, extra_headers=None):
                 print(f"Following redirect link: {direct_href}")
                 resp = _cffi_get(direct_href, headers, stream=True)
         _stream_to_file(resp, output_path)
-    else:
-        import urllib.request
-        req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req) as resp, open(output_path, "wb") as fh:
-            total = int(resp.headers.get("Content-Length", 0))
-            downloaded = 0
-            while True:
-                buf = resp.read(8192)
-                if not buf:
-                    break
-                downloaded += len(buf)
-                fh.write(buf)
-                if total:
-                    sys.stdout.write(f"\r{downloaded/total*100:.1f}%")
-                    sys.stdout.flush()
-            print()
+        return
+
+    import urllib.request
+    req = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(req, timeout=30) as resp, open(output_path, "wb") as fh:
+        total = int(resp.headers.get("Content-Length", 0))
+        if total and total > MAX_DOWNLOAD_BYTES:
+            raise ValueError(f"Content-Length is too large for a safe APK download ({total} bytes)")
+        downloaded = 0
+        while True:
+            buf = resp.read(8192)
+            if not buf:
+                break
+            downloaded += len(buf)
+            if downloaded > MAX_DOWNLOAD_BYTES:
+                raise ValueError(f"Downloaded APK exceeds safe limit ({MAX_DOWNLOAD_BYTES} bytes)")
+            fh.write(buf)
+            if total:
+                sys.stdout.write(f"\r{downloaded/total*100:.1f}%")
+                sys.stdout.flush()
+        print()
+
 
 # ---------------------------------------------------------------------------
 # APKMirror HTML parsing helpers (shared by both paths)
 # ---------------------------------------------------------------------------
+
 
 def _parse_version_tuple(ver_str):
     if not ver_str:
@@ -149,7 +216,6 @@ def _find_detail_link(soup):
     if not found:
         return None, None
 
-    # Sort by semantic version descending so the highest version (e.g. 7.90.0 > 7.89.0) is always chosen
     found.sort(key=lambda x: x[2], reverse=True)
     best_link, best_ver, _ = found[0]
     print(f"[APKMirror] Found {len(found)} releases on page. Picked highest semantic version: {best_ver}")
@@ -196,7 +262,6 @@ def _find_fallback_detail_link(session=None):
     return None, None
 
 
-
 def _find_download_page_link(detail_soup):
     btn = detail_soup.find("a", class_=re.compile(r"downloadButton|accent_bg"))
     if btn and btn.get("href"):
@@ -225,6 +290,7 @@ def _find_final_link(dl_soup, dl_html):
 # ---------------------------------------------------------------------------
 # Path 1: direct HTTP (fast, may fail with 403 on CI datacenter IPs)
 # ---------------------------------------------------------------------------
+
 
 def get_apkmirror_apk(variant_url, output_path, check_version_only=False):
     print(f"[direct] Fetching: {variant_url}")
@@ -267,6 +333,7 @@ def get_apkmirror_apk(variant_url, output_path, check_version_only=False):
         if dl_resp.status_code != 200:
             raise Exception(f"Download HTTP Error {dl_resp.status_code}")
         _stream_to_file(dl_resp, output_path)
+        _validate_apk_file(output_path)
         return version_str
     else:
         html = fetch_url(variant_url).decode("utf-8")
@@ -296,12 +363,14 @@ def get_apkmirror_apk(variant_url, output_path, check_version_only=False):
             raise Exception("Could not extract final download URL from APKMirror.")
         print(f"[direct] Downloading APK: {final_link}")
         download_file(final_link, output_path, extra_headers={"Referer": dl_page})
+        _validate_apk_file(output_path)
         return version_str
 
 
 # ---------------------------------------------------------------------------
 # Path 2: Playwright (headless Chromium — solves Cloudflare JS challenge)
 # ---------------------------------------------------------------------------
+
 
 def _ensure_playwright():
     """Install playwright and chromium browser binaries on-demand if missing."""
@@ -356,7 +425,6 @@ def get_apkmirror_apk_playwright(variant_url, output_path, check_version_only=Fa
                 "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})"
             )
 
-            # Step 1: variant listing page
             print(f"[playwright] → {variant_url}")
             page.goto(variant_url, wait_until="domcontentloaded", timeout=60000)
             _pw_wait_for_cf(page)
@@ -376,7 +444,6 @@ def get_apkmirror_apk_playwright(variant_url, output_path, check_version_only=Fa
             if not detail_link:
                 raise Exception("[playwright] Could not find download link on APKMirror variant page.")
 
-            # Step 2: APK detail page
             print(f"[playwright] → {detail_link}")
             page.goto(detail_link, wait_until="domcontentloaded", timeout=60000)
             _pw_wait_for_cf(page)
@@ -386,7 +453,6 @@ def get_apkmirror_apk_playwright(variant_url, output_path, check_version_only=Fa
             if not dl_page:
                 raise Exception("[playwright] Could not find APK download button page.")
 
-            # Step 3: download-button confirmation page
             print(f"[playwright] → {dl_page}")
             page.goto(dl_page, wait_until="domcontentloaded", timeout=60000)
             _pw_wait_for_cf(page)
@@ -398,7 +464,6 @@ def get_apkmirror_apk_playwright(variant_url, output_path, check_version_only=Fa
             if not final_link:
                 raise Exception("[playwright] Could not extract final download URL from APKMirror.")
 
-            # Step 4: download inside the live browser session by clicking download tag
             print(f"[playwright] Triggering APK download via browser session: {final_link}")
             with page.expect_download(timeout=300_000) as dl_info:
                 a_tag = page.query_selector("a[href*='download.php']")
@@ -409,7 +474,9 @@ def get_apkmirror_apk_playwright(variant_url, output_path, check_version_only=Fa
 
             download = dl_info.value
             print(f"[playwright] Saving APK ({download.suggested_filename}) to: {output_path}")
+            _ensure_parent_dir(output_path)
             download.save_as(output_path)
+            _validate_apk_file(output_path)
             return version_str
         finally:
             browser.close()
@@ -418,6 +485,7 @@ def get_apkmirror_apk_playwright(variant_url, output_path, check_version_only=Fa
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
+
 
 def main():
     parser = argparse.ArgumentParser(description="Download Google Photos APK from APKMirror")
@@ -428,10 +496,11 @@ def main():
     parser.add_argument("--retries", type=int, default=3, help="Max retry attempts for scraping (default: 3)")
     args = parser.parse_args()
 
-    # ---- direct URL shortcut ----
     if args.direct_url:
-        print(f"Downloading direct URL: {args.direct_url}")
-        download_file(args.direct_url, args.output)
+        url = _validate_direct_url(args.direct_url)
+        print(f"Downloading direct URL: {url}")
+        download_file(url, args.output)
+        _validate_apk_file(args.output)
         version_str = "unknown"
     else:
         version_str = "unknown"
@@ -439,7 +508,6 @@ def main():
         last_error = None
         for attempt in range(1, args.retries + 1):
             print(f"\n=== Download attempt {attempt}/{args.retries} ===")
-            # Try fast path first, fall back to Playwright
             try:
                 if args.check_version:
                     version_str = get_apkmirror_apk(args.variant_url, None, check_version_only=True)
@@ -455,7 +523,6 @@ def main():
                 print(f"[Attempt {attempt}] Direct scrape failed: {e}")
                 last_error = e
 
-            # Fall back to Playwright if direct failed
             try:
                 print(f"[Attempt {attempt}] Retrying with Playwright…")
                 if args.check_version:
@@ -490,12 +557,8 @@ def main():
                     f.write(f"apk_version={version_str}\n")
             return
 
-    # ---- validate download ----
     if os.path.exists(args.output) and os.path.getsize(args.output) > 1_000_000:
-        print(
-            f"Successfully downloaded {args.output} "
-            f"({os.path.getsize(args.output):,} bytes)"
-        )
+        print(f"Successfully downloaded {args.output} ({os.path.getsize(args.output):,} bytes)")
         if "GITHUB_OUTPUT" in os.environ and version_str:
             with open(os.environ["GITHUB_OUTPUT"], "a") as f:
                 f.write(f"apk_version={version_str}\n")
