@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       direct_apk_url:
-        description: 'Direct APK Download URL (Optional fallback if APKMirror scraping fails)'
+        description: 'Direct APK Download URL (APKMirror only; HTTPS required)'
         required: false
         type: string
   push:
@@ -15,17 +15,24 @@ on:
     paths-ignore:
       - '**.md'
 
+permissions:
+  contents: write
+  packages: read
+
+concurrency:
+  group: gphotos-mod-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build-and-patch:
     name: Build Patch & Release GPhotos-Mod
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      packages: read
-      actions: write
+    timeout-minutes: 120
     steps:
       - name: Checkout Release Repository
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -33,12 +40,63 @@ jobs:
           python-version: '3.x'
 
       - name: Install Python Dependencies
+        shell: bash
         run: |
+          set -euo pipefail
           python -m pip install --upgrade pip
-          pip install beautifulsoup4 curl_cffi
+          pip install --disable-pip-version-check beautifulsoup4 curl_cffi
+
+      - name: Validate manual APK URL
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.direct_apk_url != '' }}
+        shell: bash
+        env:
+          DIRECT_APK_URL: ${{ inputs.direct_apk_url }}
+        run: |
+          set -euo pipefail
+          case "$DIRECT_APK_URL" in
+            https://*.apkmirror.com/*|https://apkmirror.com/*)
+              ;;
+            *)
+              echo "::error::Only https APKMirror URLs are allowed for manual input."
+              exit 1
+              ;;
+          esac
+
+      - name: Check Latest APKMirror Version
+        id: check_upstream
+        shell: bash
+        run: |
+          python .github/scripts/download_apk.py --check-version
+
+      - name: Check Existing Release
+        id: check_release
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          RAW_VER="${{ steps.check_upstream.outputs.apk_version }}"
+          APK_VER=$(printf '%s' "$RAW_VER" | sed -E 's/[^0-9.]//g; s/\.+$//')
+          echo "Latest upstream version found: ${APK_VER:-unknown}"
+          if [ -n "$APK_VER" ] && [ "${{ github.event_name }}" = "schedule" ]; then
+            TAG="v${APK_VER}"
+            HTTP_STATUS=$(curl -fsSL --proto '=https' -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $GITHUB_TOKEN" "https://api.github.com/repos/${{ github.repository }}/releases/tags/$TAG")
+            if [ "$HTTP_STATUS" = "200" ]; then
+              echo "Release $TAG already exists in ${{ github.repository }}. Skipping duplicate build."
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
+      - name: Checkout Patches Repository (Morphe Google Photos)
+        if: ${{ steps.check_release.outputs.skip != 'true' }}
+        uses: actions/checkout@v4
+        with:
+          repository: 'Akash-Sriram/morphe-google-photos'
+          path: 'morphe-google-photos'
+          persist-credentials: false
 
       - name: Generate launcher icons from source
-        if: steps.check_release.outputs.skip != 'true' || always()
+        if: ${{ steps.check_release.outputs.skip != 'true' }}
+        shell: bash
         run: |
           set -euo pipefail
 
@@ -57,8 +115,6 @@ jobs:
           echo "Creating resource directories under $RESDIR"
           mkdir -p "$RESDIR/mipmap-mdpi" "$RESDIR/mipmap-hdpi" "$RESDIR/mipmap-xhdpi" "$RESDIR/mipmap-xxhdpi" "$RESDIR/mipmap-xxxhdpi" "$RESDIR/mipmap-anydpi-v26" "$RESDIR/values"
 
-          # Legacy launcher icon sizes (px)
-          # mdpi 48, hdpi 72, xhdpi 96, xxhdpi 144, xxxhdpi 192
           echo "Generating legacy mipmap icons..."
           convert "$ICON_SRC" -background none -gravity center -resize 48x48^ -extent 48x48 "$RESDIR/mipmap-mdpi/ic_launcher.png"
           convert "$ICON_SRC" -background none -gravity center -resize 72x72^ -extent 72x72 "$RESDIR/mipmap-hdpi/ic_launcher.png"
@@ -66,20 +122,14 @@ jobs:
           convert "$ICON_SRC" -background none -gravity center -resize 144x144^ -extent 144x144 "$RESDIR/mipmap-xxhdpi/ic_launcher.png"
           convert "$ICON_SRC" -background none -gravity center -resize 192x192^ -extent 192x192 "$RESDIR/mipmap-xxxhdpi/ic_launcher.png"
 
-          # Round icons (copy same images to ic_launcher_round)
           for d in mipmap-mdpi mipmap-hdpi mipmap-xhdpi mipmap-xxhdpi mipmap-xxxhdpi; do
             cp "$RESDIR/$d/ic_launcher.png" "$RESDIR/$d/ic_launcher_round.png"
           done
 
-          # Adaptive icon foreground (high-res). Use a large canvas so Android can scale down cleanly.
-          # We'll create a 432x432 foreground PNG (big) and let the adaptive XML reference it.
           echo "Generating adaptive foreground..."
           convert "$ICON_SRC" -background none -gravity center -resize 432x432^ -extent 432x432 "$RESDIR/mipmap-anydpi-v26/ic_launcher_foreground.png"
-
-          # Also create a scaled anydpi foreground to be safe
           convert "$ICON_SRC" -background none -gravity center -resize 108x108^ -extent 108x108 "$RESDIR/mipmap-anydpi-v26/ic_launcher_foreground_small.png"
 
-          # Adaptive icon XML (foreground + background color)
           cat > "$RESDIR/mipmap-anydpi-v26/ic_launcher.xml" <<'XML'
           <?xml version="1.0" encoding="utf-8"?>
           <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
@@ -87,8 +137,8 @@ jobs:
             <foreground android:drawable="@mipmap/ic_launcher_foreground"/>
           </adaptive-icon>
           XML
-          
-                    cat > "$RESDIR/mipmap-anydpi-v26/ic_launcher_round.xml" <<'XML'
+
+          cat > "$RESDIR/mipmap-anydpi-v26/ic_launcher_round.xml" <<'XML'
           <?xml version="1.0" encoding="utf-8"?>
           <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
             <background android:drawable="@color/ic_launcher_background"/>
@@ -96,120 +146,155 @@ jobs:
           </adaptive-icon>
           XML
 
-          # Provide a simple background color resource (modify hex if you want another color)
           cat > "$RESDIR/values/colors.xml" <<'XML'
           <?xml version="1.0" encoding="utf-8"?>
           <resources>
-              <color name="ic_launcher_background">#FFFFFFFF</color>
+            <color name="ic_launcher_background">#FFFFFFFF</color>
           </resources>
           XML
 
           echo "Icon generation completed and resources placed under $RESDIR."
 
-      - name: Check Latest APKMirror Version
-        id: check_upstream
-        run: |
-          python .github/scripts/download_apk.py --check-version
-
-      - name: Check Existing Release
-        id: check_release
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          RAW_VER="${{ steps.check_upstream.outputs.apk_version }}"
-          APK_VER=$(echo "$RAW_VER" | sed -e 's/[^0-9.]//g' -e 's/\.*$//')
-          echo "Latest upstream version found: $APK_VER"
-          if [ -n "$APK_VER" ] && [ "${{ github.event_name }}" = "schedule" ]; then
-            TAG="v${APK_VER}"
-            HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: token $GITHUB_TOKEN" "https://api.github.com/repos/${{ github.repository }}/releases/tags/$TAG")
-            if [ "$HTTP_STATUS" = "200" ]; then
-              echo "Release $TAG already exists in ${{ github.repository }}. Skipping duplicate build."
-              echo "skip=true" >> $GITHUB_OUTPUT
-            fi
-          fi
-
-      - name: Checkout Patches Repository (Morphe Google Photos)
-        if: steps.check_release.outputs.skip != 'true'
-        uses: actions/checkout@v4
-        with:
-          repository: 'Akash-Sriram/morphe-google-photos'
-          path: 'morphe-google-photos'
-
       - name: Setup Java 21
-        if: steps.check_release.outputs.skip != 'true'
+        if: ${{ steps.check_release.outputs.skip != 'true' }}
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
           java-version: '21'
 
       - name: Cache Gradle
-        if: steps.check_release.outputs.skip != 'true'
+        if: ${{ steps.check_release.outputs.skip != 'true' }}
         uses: burrunan/gradle-cache-action@v3
         with:
           build-root-directory: morphe-google-photos
 
       - name: Overlay Custom Patches from GPhotos-Mod into morphe-google-photos
-        if: steps.check_release.outputs.skip != 'true'
+        if: ${{ steps.check_release.outputs.skip != 'true' }}
+        shell: bash
         run: |
+          set -euo pipefail
           if [ -d "custom-patches" ]; then
             echo "Copying custom-patches into morphe-google-photos..."
             cp -r custom-patches/* morphe-google-photos/
           fi
 
       - name: Build Morphe Patches from morphe-google-photos
-        if: steps.check_release.outputs.skip != 'true'
+        if: ${{ steps.check_release.outputs.skip != 'true' }}
+        shell: bash
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -euo pipefail
           cd morphe-google-photos
           chmod +x gradlew
           ./gradlew :extensions:shared:syncExtension :patches:buildAndroid generatePatchesList -Pgpr.user=${{ github.actor }} -Pgpr.key=${{ secrets.GITHUB_TOKEN }}
 
       - name: Locate Patch Bundle
-        if: steps.check_release.outputs.skip != 'true'
+        if: ${{ steps.check_release.outputs.skip != 'true' }}
         id: locate_patch
+        shell: bash
         run: |
+          set -euo pipefail
           PATCH_FILE=$(find morphe-google-photos/patches/build/libs \( -name "patches-*.mpp" -o -name "patches-*.jar" \) | grep -v "\-sources" | grep -v "\-javadoc" | sort -V | tail -n 1)
           if [ -z "$PATCH_FILE" ]; then
             echo "Error: Patch file not found!"
             exit 1
           fi
-          echo "PATCH_PATH=$PATCH_FILE" >> $GITHUB_ENV
+          echo "PATCH_PATH=$PATCH_FILE" >> "$GITHUB_ENV"
           echo "Found patch file: $PATCH_FILE"
 
       - name: Setup Morphe CLI
-        if: steps.check_release.outputs.skip != 'true'
+        if: ${{ steps.check_release.outputs.skip != 'true' }}
+        shell: bash
+        env:
+          MORPHE_CLI_SHA256: ${{ secrets.MORPHE_CLI_SHA256 }}
         run: |
-          CLI_URL=$(curl -s https://api.github.com/repos/MorpheApp/morphe-desktop/releases/latest | grep "browser_download_url.*morphe-desktop.*all.jar" | cut -d '"' -f 4 | head -n 1)
+          set -euo pipefail
+          MORPHE_TAG="v1.16.0"
+          API_URL="https://api.github.com/repos/MorpheApp/morphe-desktop/releases/tags/${MORPHE_TAG}"
+          CLI_URL=$(python - <<'PY'
+          import json, urllib.request
+          url = "https://api.github.com/repos/MorpheApp/morphe-desktop/releases/tags/v1.16.0"
+          req = urllib.request.Request(url, headers={
+              "Accept": "application/vnd.github+json",
+              "User-Agent": "GPhotos-Mod-CI",
+          })
+          with urllib.request.urlopen(req, timeout=30) as resp:
+              data = json.load(resp)
+          for asset in data.get("assets", []):
+              name = asset.get("name", "")
+              if name.endswith("all.jar"):
+                  print(asset["browser_download_url"])
+                  break
+          else:
+              raise SystemExit("Could not locate Morphe CLI asset")
+          PY
+          )
           if [ -z "$CLI_URL" ]; then
-            CLI_URL="https://github.com/MorpheApp/morphe-desktop/releases/download/v1.16.0/morphe-desktop-1.16.0-all.jar"
+            echo "Could not resolve Morphe CLI download URL."
+            exit 1
           fi
-          echo "Downloading Morphe Desktop CLI from $CLI_URL"
-          curl -L -o morphe-cli.jar "$CLI_URL"
+          curl -fsSL --proto '=https' "$CLI_URL" -o morphe-cli.jar
+          if [ -n "${MORPHE_CLI_SHA256:-}" ]; then
+            ACTUAL_SHA=$(sha256sum morphe-cli.jar | awk '{print $1}')
+            if [ "$ACTUAL_SHA" != "$MORPHE_CLI_SHA256" ]; then
+              echo "::error::Morphe CLI checksum mismatch."
+              exit 1
+            fi
+          fi
 
       - name: Download Google Photos APK
-        if: steps.check_release.outputs.skip != 'true'
+        if: ${{ steps.check_release.outputs.skip != 'true' }}
         id: download_apk
+        shell: bash
+        env:
+          DIRECT_URL: ${{ inputs.direct_apk_url }}
         run: |
-          DIRECT_URL="${{ inputs.direct_apk_url }}"
-          if [ -n "$DIRECT_URL" ]; then
+          set -euo pipefail
+          if [ -n "${DIRECT_URL:-}" ]; then
+            case "$DIRECT_URL" in
+              https://*.apkmirror.com/*|https://apkmirror.com/*)
+                ;;
+              *)
+                echo "::error::Only APKMirror HTTPS URLs are allowed for manual input."
+                exit 1
+                ;;
+            esac
             python .github/scripts/download_apk.py --direct-url "$DIRECT_URL" --output google-photos-base.apk
           else
             python .github/scripts/download_apk.py --retries 3 --output google-photos-base.apk
           fi
 
+          python3 - <<'PY'
+          import zipfile
+          p = 'google-photos-base.apk'
+          with zipfile.ZipFile(p) as zf:
+              names = zf.namelist()
+              if not names or not any(name.endswith('AndroidManifest.xml') for name in names):
+                  raise SystemExit('Downloaded file does not look like a valid APK archive.')
+          print('APK structure validation passed.')
+          PY
+
       - name: Extract Actual APK Version
-        if: steps.check_release.outputs.skip != 'true'
+        if: ${{ steps.check_release.outputs.skip != 'true' }}
         id: get_apk_ver
+        shell: bash
         run: |
-          AAPT_PATH=$(find $ANDROID_HOME/build-tools -name "aapt" | sort -V | tail -n 1)
+          set -euo pipefail
+          AAPT_PATH=$(find "$ANDROID_HOME/build-tools" -name "aapt" | sort -V | tail -n 1)
+          if [ -z "$AAPT_PATH" ]; then
+            echo "::error::aapt not found in $ANDROID_HOME/build-tools"
+            exit 1
+          fi
           APK_VER=$($AAPT_PATH dump badging google-photos-base.apk | grep -oP "versionName='\K[^']+")
           echo "Actual APK version extracted: $APK_VER"
-          echo "apk_version=$APK_VER" >> $GITHUB_OUTPUT
+          echo "apk_version=$APK_VER" >> "$GITHUB_OUTPUT"
 
       - name: Patch Google Photos APKs (Mod & Original)
-        if: steps.check_release.outputs.skip != 'true'
+        if: ${{ steps.check_release.outputs.skip != 'true' }}
+        shell: bash
         run: |
+          set -euo pipefail
           echo "🧩 [1/2] Building Mod Package (com.sridhar.gphotosmod)..."
           java -jar morphe-cli.jar patch \
             -f \
@@ -234,73 +319,69 @@ jobs:
             google-photos-base.apk
 
       - name: Prepare release filenames
-        if: steps.check_release.outputs.skip != 'true'
+        if: ${{ steps.check_release.outputs.skip != 'true' }}
+        shell: bash
         run: |
+          set -euo pipefail
           APK_VER="${{ steps.get_apk_ver.outputs.apk_version }}"
-          APK_VER=$(echo "$APK_VER" | sed -e 's/[^0-9.]//g' -e 's/\.*$//')
+          APK_VER=$(printf '%s' "$APK_VER" | sed -E 's/[^0-9.]//g; s/\.+$//')
           if [ -z "$APK_VER" ]; then
             APK_VER="build-${{ github.run_number }}"
           fi
           OUT_MOD="GPhotos-Mod-v${APK_VER}-mod.apk"
           OUT_ORIGINAL="GPhotos-Mod-v${APK_VER}-original.apk"
-          echo "RELEASE_APK_MOD=${OUT_MOD}" >> $GITHUB_ENV
-          echo "RELEASE_APK_ORIGINAL=${OUT_ORIGINAL}" >> $GITHUB_ENV
-          echo "RELEASE_VERSION=${APK_VER}" >> $GITHUB_ENV
+          echo "RELEASE_APK_MOD=${OUT_MOD}" >> "$GITHUB_ENV"
+          echo "RELEASE_APK_ORIGINAL=${OUT_ORIGINAL}" >> "$GITHUB_ENV"
+          echo "RELEASE_VERSION=${APK_VER}" >> "$GITHUB_ENV"
           echo "Prepared release filenames: $OUT_MOD , $OUT_ORIGINAL"
 
       - name: Sign Patched APKs (safe decode + verify keystore)
-        if: steps.check_release.outputs.skip != 'true'
+        if: ${{ steps.check_release.outputs.skip != 'true' }}
+        shell: bash
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_ALIAS: ${{ secrets.KEYSTORE_ALIAS }}
+          KEYSTORE_PASS: ${{ secrets.KEYSTORE_PASS }}
+          KEY_PASS: ${{ secrets.KEY_PASS }}
         run: |
           set -euo pipefail
 
           APK_VER="${{ steps.get_apk_ver.outputs.apk_version }}"
-          APK_VER=$(echo "$APK_VER" | sed -e 's/[^0-9.]//g' -e 's/\.*$//')
+          APK_VER=$(printf '%s' "$APK_VER" | sed -E 's/[^0-9.]//g; s/\.+$//')
           if [ -z "$APK_VER" ]; then
             APK_VER="build-${{ github.run_number }}"
           fi
           OUT_MOD="GPhotos-Mod-v${APK_VER}-mod.apk"
           OUT_ORIGINAL="GPhotos-Mod-v${APK_VER}-original.apk"
+          KS_ALIAS="${KEYSTORE_ALIAS:-gphotosmod}"
+          KS_PASS="${KEYSTORE_PASS:-android}"
+          KEY_PASS_VALUE="${KEY_PASS:-android}"
 
-          if [ -n "${{ secrets.KEYSTORE_BASE64 }}" ]; then
-            echo "Decoding provided KEYSTORE_BASE64 into release.keystore (using printf -> base64 -d)..."
-            printf '%s' "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > release.keystore || {
+          if [ -n "${KEYSTORE_BASE64:-}" ]; then
+            echo "Decoding provided KEYSTORE_BASE64 into release.keystore..."
+            printf '%s' "$KEYSTORE_BASE64" | base64 -d > release.keystore || {
               echo "ERROR: base64 decode failed. The KEYSTORE_BASE64 secret may be corrupted or not valid base64."
               exit 2
             }
 
-            echo "Verifying keystore with keytool..."
-            if ! keytool -list -keystore release.keystore -storepass android -storetype PKCS12 >/dev/null 2>&1; then
+            if ! keytool -list -keystore release.keystore -storepass "$KS_PASS" -storetype PKCS12 >/dev/null 2>&1; then
               echo "ERROR: keytool failed to read the decoded keystore (PKCS12)."
               exit 3
             fi
-
-            KS_ALIAS="${{ secrets.KEYSTORE_ALIAS || 'gphotosmod' }}"
-            KS_PASS="${{ secrets.KEYSTORE_PASS || 'android' }}"
-            KEY_PASS="${{ secrets.KEY_PASS || 'android' }}"
           else
-            echo "No KEYSTORE_BASE64 provided — generating new keystore for this run (will print base64 below)."
+            echo "No KEYSTORE_BASE64 provided — generating a new temporary keystore for this run."
             keytool -genkeypair \
-              -alias gphotosmod \
+              -alias "$KS_ALIAS" \
               -keyalg RSA -keysize 2048 \
               -validity 10000 \
               -dname "CN=GPhotos-Mod, OU=CI, O=GPhotos-Mod, L=Internet, S=Internet, C=US" \
               -keystore release.keystore \
-              -storepass android \
-              -keypass android \
+              -storepass "$KS_PASS" \
+              -keypass "$KEY_PASS_VALUE" \
               -storetype PKCS12
-
-            KS_ALIAS="gphotosmod"
-            KS_PASS="android"
-            KEY_PASS="android"
-
-            echo "-----BEGIN RELEASE_KEYSTORE_BASE64-----"
-            base64 -w0 release.keystore || base64 release.keystore
-            echo
-            echo "-----END RELEASE_KEYSTORE_BASE64-----"
-            echo "Copy the base64 blob above and save as repository secret KEYSTORE_BASE64 for future runs."
           fi
 
-          BUILD_TOOLS_DIR=$(ls -d $ANDROID_HOME/build-tools/* | sort -V | tail -n 1)
+          BUILD_TOOLS_DIR=$(ls -d "$ANDROID_HOME/build-tools"/* | sort -V | tail -n 1)
 
           for FLAVOR in mod original; do
             echo "Processing ${FLAVOR} package..."
@@ -313,20 +394,20 @@ jobs:
 
             python3 .github/scripts/repack_apk.py --input "$IN_UNSIGNED" --output "patched-${FLAVOR}-fixed.apk"
 
-            $BUILD_TOOLS_DIR/zipalign -v -p 4 "patched-${FLAVOR}-fixed.apk" "patched-${FLAVOR}-aligned.apk"
+            "$BUILD_TOOLS_DIR/zipalign" -v -p 4 "patched-${FLAVOR}-fixed.apk" "patched-${FLAVOR}-aligned.apk"
 
             TARGET_OUT=$([ "$FLAVOR" = "mod" ] && echo "$OUT_MOD" || echo "$OUT_ORIGINAL")
             echo "Signing -> $TARGET_OUT"
-            $BUILD_TOOLS_DIR/apksigner sign \
+            "$BUILD_TOOLS_DIR/apksigner" sign \
               --ks release.keystore \
-              --ks-pass pass:$KS_PASS \
-              --key-pass pass:$KEY_PASS \
-              --ks-key-alias $KS_ALIAS \
+              --ks-pass pass:"$KS_PASS" \
+              --key-pass pass:"$KEY_PASS_VALUE" \
+              --ks-key-alias "$KS_ALIAS" \
               --out "${TARGET_OUT}" \
               "patched-${FLAVOR}-aligned.apk"
 
             echo "Verifying signature for ${TARGET_OUT}..."
-            $BUILD_TOOLS_DIR/apksigner verify --verbose "${TARGET_OUT}"
+            "$BUILD_TOOLS_DIR/apksigner" verify --verbose "${TARGET_OUT}"
 
             rm -f "patched-${FLAVOR}-fixed.apk" "patched-${FLAVOR}-aligned.apk"
           done
@@ -334,24 +415,26 @@ jobs:
           rm -f release.keystore || true
 
       - name: Upload Mod APK Artifact
-        if: steps.check_release.outputs.skip != 'true'
+        if: ${{ steps.check_release.outputs.skip != 'true' }}
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.RELEASE_APK_MOD }}
           path: ${{ env.RELEASE_APK_MOD }}
 
       - name: Upload Original APK Artifact
-        if: steps.check_release.outputs.skip != 'true'
+        if: ${{ steps.check_release.outputs.skip != 'true' }}
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.RELEASE_APK_ORIGINAL }}
           path: ${{ env.RELEASE_APK_ORIGINAL }}
 
       - name: Publish or Update Patched APK Release
-        if: steps.check_release.outputs.skip != 'true' && (github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule')
+        if: ${{ steps.check_release.outputs.skip != 'true' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
         run: |
+          set -euo pipefail
           TAG="v${{ env.RELEASE_VERSION }}"
           TITLE="GPhotos-Mod v${{ env.RELEASE_VERSION }}"
           APK_MOD="${{ env.RELEASE_APK_MOD }}"
