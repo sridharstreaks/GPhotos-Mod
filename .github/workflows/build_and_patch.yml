@@ -30,7 +30,7 @@ jobs:
     timeout-minutes: 120
     steps:
       - name: Checkout Release Repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           persist-credentials: false
 
@@ -88,7 +88,7 @@ jobs:
 
       - name: Checkout Patches Repository (Morphe Google Photos)
         if: ${{ steps.check_release.outputs.skip != 'true' }}
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: 'Akash-Sriram/morphe-google-photos'
           path: 'morphe-google-photos'
